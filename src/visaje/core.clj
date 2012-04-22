@@ -134,7 +134,6 @@
   (use 'visaje.core)
   (use 'vmfest.manager)
   (def my-server (server "http://localhost:18083"))
-  (new-image my-server {:location "/tmp/debian-test-2.vdi" :size (* 1024 8)})
   (def my-machine
     (install-os my-server
                 "debian-test-2"
@@ -144,8 +143,6 @@
                 [:esc 500
                  "auto url=http://10.0.2.2/~tbatchelli/deb-preseed.cfg netcfg/choose_interface=eth0"
                  :enter]
-                "vmfest" "vmfest"))
-
-  )
+                "vmfest" "vmfest")))
 
 
