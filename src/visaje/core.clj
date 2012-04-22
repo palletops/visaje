@@ -5,9 +5,10 @@
                                send-keyboard stop destroy power-down
                                make-disk-immutable new-image]]
         [clojure.string :only [blank?]]
-        [clj-ssh.ssh :only [ssh]]
+
         [clojure.java.io :only (input-stream)])
-  (:require [clojure.tools.logging :as log]))
+  (:require [clojure.tools.logging :as log]
+            [clj-ssh.ssh :as ssh]))
 
 
 (defn install-machine-spec [disk-location os-iso-location vbox-iso-location]
@@ -37,22 +38,20 @@
           result)))))
 
 (defn reached-target-runlevel? [ip user password]
-  (let [[_ target-init _]
-        (ssh ip :username user
-             :password password
-             :strict-host-key-checking false
-             :cmd [ "/bin/grep initdefault /etc/inittab | cut -d\":\" -f2"])
-        target-init (first (clojure.string/split-lines target-init))
-        [_ current-init _]
-        (ssh ip :username user
-             :password password
-             :strict-host-key-checking false
-             :cmd [ "/sbin/runlevel | cut -d\" \" -f2"])
-        current-init (first (clojure.string/split-lines current-init))]
-    (log/infof "Target runlevel for %s is %s, and current runlevel is %s"
-               ip target-init current-init)
-    (when (= target-init current-init)
-      current-init)))
+  (ssh/with-ssh-agent []
+    (let [session (ssh/session ip :username user :password password
+                               :strict-host-key-checking :no)
+          [_ target-init _]
+          (ssh/ssh session
+                   :cmd [ "/bin/grep initdefault /etc/inittab | cut -d\":\" -f2"])
+          target-init (first (clojure.string/split-lines target-init))
+          [_ current-init _]
+          (ssh/ssh session :cmd [ "/sbin/runlevel | cut -d\" \" -f2"])
+          current-init (first (clojure.string/split-lines current-init))]
+      (log/infof "Target runlevel for %s is %s, and current runlevel is %s"
+                 ip target-init current-init)
+      (when (= target-init current-init)
+        current-init))))
 
 (defn- get-ip [machine slot]
   (log/debugf "get-ip: getting IP Address for %s" (:id machine))
@@ -62,12 +61,6 @@
          (log/debugf "get-ip: Machine %s not started."  (:id machine)))
        (catch Exception e
          (log/debugf "get-ip: Machine %s not accessible." (:id machine)))))
-
-(defn run-commands [machine user password commands]
-  (let [ip (get-ip machine 1)]
-    (ssh ip :username user :password password
-         :strict-host-key-checking false
-         :cmd commands)))
 
 (defn wait-for-installation-finished [machine user password interval timeout]
   ;; todo: this should stop if the machine ceases to exist
