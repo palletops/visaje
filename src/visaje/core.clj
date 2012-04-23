@@ -6,12 +6,14 @@
                                make-disk-immutable new-image]]
         [clojure.string :only [blank?]]
 
-        [clojure.java.io :only (input-stream)])
+        [clojure.java.io :only (input-stream)]
+        [clojure.pprint :only (pprint)])
   (:require [clojure.tools.logging :as log]
             [clj-ssh.ssh :as ssh]))
 
 
-(defn install-machine-spec [disk-location os-iso-location vbox-iso-location]
+(defn install-machine-spec [disk-location os-iso-location vbox-iso-location
+                            memory-size]
   {:cpu-count 1,
    :network
    [{:attachment-type :nat}
@@ -25,7 +27,7 @@
                {:device-type :dvd :location vbox-iso-location}],
      :name "IDE Controller",
      :bus :ide}],
-   :memory-size 2048})
+   :memory-size memory-size})
 
 (defn wait-for
   [exit?-fn wait-interval timeout]
@@ -37,21 +39,23 @@
               (recur))
           result)))))
 
-(defn reached-target-runlevel? [ip user password]
+(defn fully-installed? [ip user password]
   (ssh/with-ssh-agent []
     (let [session (ssh/session ip :username user :password password
-                               :strict-host-key-checking :no)
-          [_ target-init _]
-          (ssh/ssh session
-                   :cmd [ "/bin/grep initdefault /etc/inittab | cut -d\":\" -f2"])
-          target-init (first (clojure.string/split-lines target-init))
-          [_ current-init _]
-          (ssh/ssh session :cmd [ "/sbin/runlevel | cut -d\" \" -f2"])
-          current-init (first (clojure.string/split-lines current-init))]
-      (log/infof "Target runlevel for %s is %s, and current runlevel is %s"
-                 ip target-init current-init)
-      (when (= target-init current-init)
-        current-init))))
+                               :strict-host-key-checking :no)]
+      (when-not (ssh/connected? session)
+        (try
+          (ssh/connect session 5000) ;; try for 5 seconds only
+          (catch Exception _ nil)))
+      (when (ssh/connected? session)
+        (let [[_ vbox-init-found _]
+              (ssh/ssh session
+                       :cmd [ "if [ -e /etc/init.d/vbox ] ; then echo \"yes\"; fi"])]
+          (if (= "yes\n" vbox-init-found)
+            (do (log/debugf "VBox Guest Additions not fully installed yet at %s" ip)
+                nil)
+            true))))))
+
 
 (defn- get-ip [machine slot]
   (log/debugf "get-ip: getting IP Address for %s" (:id machine))
@@ -69,58 +73,85 @@
   ;; process reboots the machine once it is finished.
   (wait-for
    #(if-let [ip (get-ip machine 1)]
-      (reached-target-runlevel? ip user password))
+      (fully-installed? ip user password))
    interval
    timeout))
 
-(defn install-os [server name disk-location size-in-mb os-iso-location vbox-iso-location
-                  boot-key-sequence user password]
-  (new-image server {:location disk-location :size size-in-mb})
-  (with-vbox server [_ vbox]
-    (let [dvd-medium (find-medium vbox os-iso-location)
-          vbox-medium (find-medium vbox vbox-iso-location)
-          ;; if the dvd image wasn't opened, close it after we're done
-          should-close-dvd? (nil? dvd-medium)
-          ;; open the medium if it is not already open
-          os-medium (or dvd-medium
-                        (open-medium vbox os-iso-location :dvd))
-          vbox-medium (or vbox-medium
-                          (open-medium vbox vbox-iso-location :dvd))
-          hardware-spec (install-machine-spec
-                         disk-location
-                         os-iso-location
-                         vbox-iso-location)]
-      (try
-        (let [vm (instance server name {} hardware-spec)]
-          (log/infof "%s: Starting VM... " name)
-          (start vm)
-          ;; wait for the machine to start
-          (Thread/sleep 5000)
-          (send-keyboard vm boot-key-sequence)
-          (log/infof "%s: Waiting for installation to finish." name)
-          ;; the installation is going to take at least 3 mintues,
-          ;; no?, no need to start polling ASAP
-          (Thread/sleep (* 3 60 1000))
-          ;; let's start testing whether the installation is done
-          (wait-for-installation-finished vm user password 5000 300000)
-          (log/infof "%s: Installation has finished successfully." name)
-          ;; let's give it some time to settle
-          (log/infof "%s: Waiting the booting to settle" name)
-          (Thread/sleep (* 30 1000))
-          (stop vm)
-          (log/infof "%s: Waiting for the OS to shut down cleanly" name)
-          (Thread/sleep (* 30 1000))
-          (log/infof "%s: Powering the VM down" name)
-          (power-down vm)
-          (log/infof "%s: Destroying the VM and leaving the image in %s"
-                     name disk-location)
-          (destroy vm :delete-disks false)
-          (log/infof "%s: compacting image at %s " name disk-location)
-          (make-disk-immutable server disk-location)
-          (log/infof
-           "%s: We're done here. You can find your shinny new image at: %s"
-           name disk-location)
-          disk-location)))))
+(def defaults
+  {:disk-size (* 8 1024) ;; 8GB
+   :memory-size (* 2 1024)
+   :wait-start 5             ;; 5 seconds
+   :wait-boot (* 60 3)       ;; 3 minutes
+   :install-poll-interval 5  ;; seconds
+   :install-timeout (* 5 60) ;; 5 minutes
+   :post-install-wait 30     ;; seconds
+   :shut-down-wait 30        ;; seconds
+   })
+
+(defn wait-sec [n]
+  (Thread/sleep (* 1000 n)))
+
+(defn install-os [server config]
+  (let [{:keys [name disk-location disk-size os-iso-location
+                vbox-iso-location boot-key-sequence user password
+                memory-size wait-start wait-boot install-poll-interval
+                install-timeout post-install-wait shut-down-wait]
+         :as config}
+        (merge defaults config)]
+    (log/debugf "Building image for %s based on:\n%s"
+               name (with-out-str (pprint config)))
+    ;; create the image file where the OS will be installed
+    (new-image server {:location disk-location :size disk-size})
+    (with-vbox server [_ vbox]
+      ;; find if the DVD ISOs are registered, and if not, register them.
+      (let [dvd-medium (find-medium vbox os-iso-location)
+            vbox-medium (find-medium vbox vbox-iso-location)
+            ;; if the dvd image wasn't opened, close it after we're done
+            should-close-dvd? (nil? dvd-medium)
+            ;; open the medium if it is not already open
+            os-medium (or dvd-medium
+                          (open-medium vbox os-iso-location :dvd))
+            vbox-medium (or vbox-medium
+                            (open-medium vbox vbox-iso-location :dvd))
+            ;; build the hardware spec for the VM
+            hardware-spec (install-machine-spec
+                           disk-location
+                           os-iso-location
+                           vbox-iso-location
+                           memory-size)]
+        (try
+          (let [vm (instance server name {} hardware-spec)]
+            (log/infof "%s: Starting VM... " name)
+            (start vm)
+            ;; wait for the machine to start
+            (wait-sec wait-start)
+            (send-keyboard vm boot-key-sequence)
+            (log/infof "%s: Waiting for installation to finish." name)
+            ;; the installation is going to take at least 3 mintues,
+            ;; no?, no need to start polling ASAP
+            (wait-sec wait-boot)
+            ;; let's start testing whether the installation is done
+            (wait-for-installation-finished vm user password
+                                            (* 1000 install-poll-interval)
+                                            (* 1000 install-timeout))
+            (log/infof "%s: Installation has finished successfully." name)
+            ;; let's give it some time to settle
+            (log/infof "%s: Waiting the booting to settle" name)
+            (wait-sec post-install-wait)
+            (stop vm)
+            (log/infof "%s: Waiting for the OS to shut down cleanly" name)
+            (wait-sec shut-down-wait)
+            (log/infof "%s: Powering the VM down" name)
+            (power-down vm)
+            (log/infof "%s: Destroying the VM and leaving the image in %s"
+                       name disk-location)
+            (destroy vm :delete-disks false)
+            (log/infof "%s: compacting image at %s " name disk-location)
+            (make-disk-immutable server disk-location)
+            (log/infof
+             "%s: We're done here. You can find your shinny new image at: %s"
+             name disk-location)
+            disk-location))))))
 
 (comment
   TODO
@@ -136,13 +167,18 @@
   (def my-server (server "http://localhost:18083"))
   (def my-machine
     (install-os my-server
-                "debian-test-2"
-                "/tmp/debian-test-2.vdi" (* 8 1024)
-                "/Users/tbatchelli/Desktop/ISOS/debian-6.0.2.1-amd64-netinst.iso"
-                "/Users/tbatchelli/Desktop/ISOS/VBoxGuestAdditions.iso"
-                [:esc 500
-                 "auto url=http://10.0.2.2/~tbatchelli/deb-preseed.cfg netcfg/choose_interface=eth0"
-                 :enter]
-                "vmfest" "vmfest")))
+                {:name "debian-test-2"
+                 :disk-location "/tmp/debian-test-2.vdi"
+                 :disk-size (* 8 1024)
+                 :os-iso-location
+                 "/Users/tbatchelli/Desktop/ISOS/debian-6.0.2.1-amd64-netinst.iso"
+                 :vbox-iso-location
+                 "/Users/tbatchelli/Desktop/ISOS/VBoxGuestAdditions.iso"
+                 :boot-key-sequence
+                  [:esc 500
+                   "auto url=http://10.0.2.2/~tbatchelli/deb-preseed.cfg netcfg/choose_interface=eth0"
+                   :enter]
+                 :user "vmfest"
+                 :password "vmfest"})))
 
 
