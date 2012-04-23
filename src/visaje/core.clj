@@ -37,21 +37,23 @@
               (recur))
           result)))))
 
-(defn reached-target-runlevel? [ip user password]
+(defn fully-installed? [ip user password]
   (ssh/with-ssh-agent []
     (let [session (ssh/session ip :username user :password password
-                               :strict-host-key-checking :no)
-          [_ target-init _]
-          (ssh/ssh session
-                   :cmd [ "/bin/grep initdefault /etc/inittab | cut -d\":\" -f2"])
-          target-init (first (clojure.string/split-lines target-init))
-          [_ current-init _]
-          (ssh/ssh session :cmd [ "/sbin/runlevel | cut -d\" \" -f2"])
-          current-init (first (clojure.string/split-lines current-init))]
-      (log/infof "Target runlevel for %s is %s, and current runlevel is %s"
-                 ip target-init current-init)
-      (when (= target-init current-init)
-        current-init))))
+                               :strict-host-key-checking :no)]
+      (when-not (ssh/connected? session)
+        (try
+          (ssh/connect session 5000) ;; try for 5 seconds only
+          (catch Exception _ nil)))
+      (when (ssh/connected? session)
+        (let [[_ vbox-init-found _]
+              (ssh/ssh session
+                       :cmd [ "if [ -e /etc/init.d/vbox ] ; then echo \"yes\"; fi"])]
+          (if (= "yes\n" vbox-init-found)
+            (do (log/debugf "VBox Guest Additions not fully installed yet at %s" ip)
+                nil)
+            true))))))
+
 
 (defn- get-ip [machine slot]
   (log/debugf "get-ip: getting IP Address for %s" (:id machine))
@@ -69,7 +71,7 @@
   ;; process reboots the machine once it is finished.
   (wait-for
    #(if-let [ip (get-ip machine 1)]
-      (reached-target-runlevel? ip user password))
+      (fully-installed? ip user password))
    interval
    timeout))
 
