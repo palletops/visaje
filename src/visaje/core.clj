@@ -7,7 +7,9 @@
         [clojure.string :only [blank?]]
 
         [clojure.java.io :only (input-stream)]
-        [clojure.pprint :only (pprint)])
+        [clojure.pprint :only (pprint)]
+        [visaje.file-server :only [register-seed-files unregister-seed-files
+                                   url-for-seed]])
   (:require [clojure.tools.logging :as log]
             [clj-ssh.ssh :as ssh]))
 
@@ -91,15 +93,30 @@
 (defn wait-sec [n]
   (Thread/sleep (* 1000 n)))
 
+(defn boot-sequence [url]
+  [:esc 500
+   (format "auto url=%s netcfg/choose_interface=eth0" url)
+   :enter])
+
 (defn install-os [server config]
   (let [{:keys [name disk-location disk-size os-iso-location
                 vbox-iso-location boot-key-sequence user password
                 memory-size wait-start wait-boot install-poll-interval
-                install-timeout post-install-wait shut-down-wait]
+                install-timeout post-install-wait shut-down-wait
+                preseed]
          :as config}
-        (merge defaults config)]
-    (log/debugf "Building image for %s based on:\n%s"
-               name (with-out-str (pprint config)))
+        (merge defaults config)
+        seed-id (register-seed-files {"preseed" preseed})
+        boot-key-sequence (or boot-key-sequence
+                              (boot-sequence
+                               (url-for-seed seed-id "preseed")))]
+    (log/debugf (str "Building image for %s based on:\n%s\nand preseed:\n"
+                     "---------------- BEGIN PRESEED -----------------\n"
+                     "%s\n"
+                     "----------------- END PRESEED ------------------")
+                name
+                (with-out-str (pprint (dissoc config :preseed)))
+                (:preseed config))
     ;; create the image file where the OS will be installed
     (new-image server {:location disk-location :size disk-size})
     (with-vbox server [_ vbox]
@@ -151,7 +168,9 @@
             (log/infof
              "%s: We're done here. You can find your shinny new image at: %s"
              name disk-location)
-            disk-location))))))
+            disk-location)
+          (finally
+           (unregister-seed-files seed-id)))))))
 
 (comment
   TODO

@@ -3,7 +3,7 @@
 
 (defonce seeds (atom {}))
 (defonce last-seed-id (atom 0))
-(defonce server (run-jetty #'file-server {:port 8055 :join? false}))
+(def ^{:dynamic true} *port*  8055)
 
 (defn file-server [{:keys [uri] :as req}]
   (let [[_ seed-id file-name]  (clojure.string/split uri #"/")
@@ -14,6 +14,11 @@
        :headers {"ContentType" "text/plain"}
        :body content}
       {:status 404})))
+
+(defonce server (run-jetty #'file-server {:port *port* :join? false}))
+
+(defn url-for-seed [seed-id file-name]
+  (format "http://10.0.2.2:%s/%s/%s" *port* seed-id file-name))
 
 (defn register-seed-files [name-content-map]
   (let [seed-id (swap! last-seed-id inc)]
